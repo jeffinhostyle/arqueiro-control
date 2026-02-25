@@ -1,221 +1,238 @@
 import os
-import sqlite3
-import json
 import re
+import sqlite3
+import threading
+import tempfile
 from datetime import datetime, timedelta
+
+# Importações do Flask para o servidor web
+from flask import Flask
+
+# Importações do Telegram Bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+
+# Importações para processamento de áudio
 import speech_recognition as sr
 from pydub import AudioSegment
-import tempfile
-import threading
-from flask import Flask
-import random
-import string
 
-# ==================== CONFIGURAÇÕES ====================
-TOKEN = "8778081445:AAF8PEnPHntpnN3wjqNGAfTzWNPhJV_4VxM"  # COLE SEU TOKEN
-ADMIN_ID = 5052937721  # COLE SEU ID
-CONTATO = "@jeffinhooliveira"
+# Carregar variáveis de ambiente
+from dotenv import load_dotenv
+load_dotenv()
+
+# Configurações
+TOKEN = os.getenv("TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+CONTATO = os.getenv("CONTATO")
 
 # ==================== BANCO DE DADOS ====================
+
+DB_NAME = 'assistente.db'
+
 def init_db():
-    conn = sqlite3.connect('assistente.db')
+    """Inicializa o banco de dados com todas as tabelas"""
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # Usuários
-    c.execute('''CREATE TABLE IF NOT EXISTS usuarios
-                 (id INTEGER PRIMARY KEY,
-                  telegram_id INTEGER UNIQUE,
-                  nome TEXT,
-                  data_expiracao TEXT,
-                  ativo INTEGER DEFAULT 0)''')
+    # Tabela de usuários para controle de acesso
+    c.execute('''CREATE TABLE IF NOT EXISTS usuarios (
+                 telegram_id INTEGER PRIMARY KEY,
+                 nome TEXT,
+                 data_expiracao TEXT,
+                 ativo INTEGER DEFAULT 1
+    )''')
     
-    # Códigos
-    c.execute('''CREATE TABLE IF NOT EXISTS codigos
-                 (id INTEGER PRIMARY KEY,
-                  codigo TEXT UNIQUE,
-                  dias INTEGER,
-                  usado INTEGER DEFAULT 0)''')
+    # Tabela de códigos de acesso
+    c.execute('''CREATE TABLE IF NOT EXISTS codigos (
+                 codigo TEXT PRIMARY KEY,
+                 dias INTEGER,
+                 usado INTEGER DEFAULT 0
+    )''')
     
-    # GASTOS
-    c.execute('''CREATE TABLE IF NOT EXISTS gastos
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  descricao TEXT,
-                  valor REAL,
-                  data TEXT,
-                  categoria TEXT)''')
+    # Tabela de dívidas a receber (alguém te deve)
+    c.execute('''CREATE TABLE IF NOT EXISTS dividas_receber (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 cliente TEXT,
+                 valor REAL,
+                 motivo TEXT,
+                 data_criacao TEXT,
+                 status TEXT DEFAULT 'pendente'
+    )''')
     
-    # GANHOS
-    c.execute('''CREATE TABLE IF NOT EXISTS ganhos
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  descricao TEXT,
-                  valor REAL,
-                  data TEXT,
-                  de_quem TEXT)''')
+    # Tabela de dívidas a pagar (você deve a alguém)
+    c.execute('''CREATE TABLE IF NOT EXISTS dividas_pagar (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 credor TEXT,
+                 valor REAL,
+                 motivo TEXT,
+                 data_criacao TEXT,
+                 status TEXT DEFAULT 'pendente'
+    )''')
     
-    # DÍVIDAS A RECEBER (clientes devem pra você)
-    c.execute('''CREATE TABLE IF NOT EXISTS dividas_receber
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  cliente TEXT,
-                  valor REAL,
-                  motivo TEXT,
-                  data_criacao TEXT,
-                  data_vencimento TEXT,
-                  status TEXT DEFAULT 'pendente')''')
+    # Tabela de gastos
+    c.execute('''CREATE TABLE IF NOT EXISTS gastos (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 descricao TEXT,
+                 valor REAL,
+                 data TEXT,
+                 categoria TEXT
+    )''')
     
-    # DÍVIDAS A PAGAR (você deve para outros)
-    c.execute('''CREATE TABLE IF NOT EXISTS dividas_pagar
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  credor TEXT,
-                  valor REAL,
-                  motivo TEXT,
-                  data_criacao TEXT,
-                  data_vencimento TEXT,
-                  status TEXT DEFAULT 'pendente')''')
+    # Tabela de ganhos
+    c.execute('''CREATE TABLE IF NOT EXISTS ganhos (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 descricao TEXT,
+                 valor REAL,
+                 data TEXT,
+                 de_quem TEXT
+    )''')
     
-    # PAGAMENTOS DE DÍVIDAS
-    c.execute('''CREATE TABLE IF NOT EXISTS pagamentos
-                 (id INTEGER PRIMARY KEY,
-                  divida_id INTEGER,
-                  tipo TEXT,  # 'receber' ou 'pagar'
-                  valor REAL,
-                  data TEXT)''')
+    # Tabela de vendas
+    c.execute('''CREATE TABLE IF NOT EXISTS vendas (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 cliente TEXT,
+                 produto TEXT,
+                 valor REAL,
+                 data TEXT,
+                 pago INTEGER DEFAULT 1
+    )''')
     
-    # CLIENTES
-    c.execute('''CREATE TABLE IF NOT EXISTS clientes
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  nome TEXT,
-                  telefone TEXT,
-                  observacoes TEXT)''')
+    # Tabela de produtos (para facilitar vendas)
+    c.execute('''CREATE TABLE IF NOT EXISTS produtos (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 nome TEXT,
+                 preco REAL
+    )''')
     
-    # PRODUTOS
-    c.execute('''CREATE TABLE IF NOT EXISTS produtos
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  nome TEXT,
-                  preco REAL)''')
+    # Tabela de pagamentos (para registrar quitações de dívidas)
+    c.execute('''CREATE TABLE IF NOT EXISTS pagamentos (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 divida_id INTEGER,
+                 tipo TEXT, -- 'pagar' ou 'receber'
+                 valor REAL,
+                 data TEXT
+    )''')
     
-    # VENDAS
-    c.execute('''CREATE TABLE IF NOT EXISTS vendas
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  cliente TEXT,
-                  produto TEXT,
-                  quantidade INTEGER,
-                  valor REAL,
-                  data TEXT,
-                  pago INTEGER DEFAULT 1)''')
+    # Tabela de clientes
+    c.execute('''CREATE TABLE IF NOT EXISTS clientes (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 nome TEXT,
+                 telefone TEXT
+    )''')
     
-    # CONVERSA - para memória de longo prazo
-    c.execute('''CREATE TABLE IF NOT EXISTS memoria
-                 (id INTEGER PRIMARY KEY,
-                  user_id INTEGER,
-                  chave TEXT,
-                  valor TEXT,
-                  data TEXT)''')
+    # Tabela de memória (para o comando "lembra")
+    c.execute('''CREATE TABLE IF NOT EXISTS memoria (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 chave TEXT,
+                 valor TEXT,
+                 data TEXT
+    )''')
     
     conn.commit()
     conn.close()
 
 # ==================== FUNÇÕES AUXILIARES ====================
 
-def gerar_codigo():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-
-def verificar_acesso(user_id):
+def verificar_acesso(user_id: int) -> bool:
+    """Verifica se o usuário tem acesso ao bot"""
     if user_id == ADMIN_ID:
         return True
     
-    conn = sqlite3.connect('assistente.db')
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute("SELECT data_expiracao, ativo FROM usuarios WHERE telegram_id = ?", (user_id,))
+    c.execute('''SELECT data_expiracao FROM usuarios WHERE telegram_id = ? AND ativo = 1''', (user_id,))
     result = c.fetchone()
     conn.close()
     
-    if result and result[1] == 1:
-        if result[0]:
-            expiracao = datetime.strptime(result[0], "%Y-%m-%d")
-            if expiracao > datetime.now():
-                return True
-        else:
+    if not result:
+        return False
+    
+    expiracao = result[0]
+    if expiracao is None:  # Acesso vitalício
+        return True
+    
+    try:
+        data_exp = datetime.strptime(expiracao, "%Y-%m-%d")
+        if data_exp >= datetime.now():
             return True
+    except ValueError:
+        pass # Se a data for inválida, nega acesso
+    
     return False
 
-def extrair_valor(texto):
-    """Extrai valor numérico do texto"""
-    # Procura padrões como: 50, 50.00, 50,00, 50 reais, R$50
-    padroes = [
-        r'(\d+[.,]\d{2})',  # 50.00 ou 50,00
-        r'(\d+)\s*reais',    # 50 reais
-        r'r\$\s*(\d+)',      # R$50
-        r'(\d+)'              # 50
-    ]
-    
-    for padrao in padroes:
-        match = re.search(padrao, texto, re.IGNORECASE)
-        if match:
-            valor = match.group(1).replace(',', '.')
-            return float(valor)
+def extrair_valor(texto: str) -> float:
+    """Extrai um valor numérico de um texto"""
+    # Padrões para encontrar valores como "50", "50.50", "50,50", "R$ 50"
+    padrao = r'(?:R\$?\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+,\d{2}|\d+)'
+    match = re.search(padrao, texto.replace('.', '').replace(',', '.'), re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
     return None
 
-def extrair_pessoa(texto):
-    """Extrai nome de pessoa do texto"""
-    # Lista de nomes comuns
-    nomes_comuns = ['jefferson', 'paulo', 'joão', 'joao', 'maria', 'jose', 'ana', 'carlos', 'pedro', 'lucas']
-    
-    texto_lower = texto.lower()
-    
-    # Procura por nomes na lista
-    for nome in nomes_comuns:
-        if nome in texto_lower:
-            return nome.capitalize()
-    
-    # Procura palavras com primeira letra maiúscula (provável nome)
+def extrair_pessoa(texto: str) -> str:
+    """Tenta extrair um nome próprio (pessoa) do texto"""
+    # Simplificação: pega a primeira palavra com letra maiúscula que não está no início
     palavras = texto.split()
-    for palavra in palavras:
+    for i, palavra in enumerate(palavras[1:], 1): # Ignora a primeira palavra
         if palavra[0].isupper() and len(palavra) > 2:
             return palavra
-    
     return None
 
-def extrair_data(texto):
-    """Extrai referência de data do texto"""
+def extrair_data(texto: str) -> str:
+    """Extrai uma data ou retorna a data atual com base em palavras-chave"""
+    texto_lower = texto.lower()
     hoje = datetime.now()
     
-    if 'hoje' in texto.lower():
+    if 'hoje' in texto_lower:
         return hoje.strftime("%Y-%m-%d")
-    elif 'ontem' in texto.lower():
+    elif 'ontem' in texto_lower:
         return (hoje - timedelta(days=1)).strftime("%Y-%m-%d")
-    elif 'semana' in texto.lower():
-        if 'passada' in texto.lower():
-            return (hoje - timedelta(days=7)).strftime("%Y-%m-%d")
-        else:
-            return (hoje - timedelta(days=hoje.weekday())).strftime("%Y-%m-%d")
-    elif 'mês' in texto.lower() or 'mes' in texto.lower():
-        if 'passado' in texto.lower():
-            return hoje.replace(day=1) - timedelta(days=1)
-        else:
-            return hoje.replace(day=1).strftime("%Y-%m-%d")
+    
+    # Tenta encontrar uma data no formato DD/MM ou YYYY-MM-DD
+    padrao_data = r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2})'
+    match = re.search(padrao_data, texto)
+    if match:
+        data_str = match.group(1)
+        if '-' in data_str: # Formato YYYY-MM-DD
+            return data_str
+        else: # Formato DD/MM
+            try:
+                dia, mes = map(int, data_str.split('/'))
+                return hoje.replace(day=dia, month=mes).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+    
     return hoje.strftime("%Y-%m-%d")
+
+def gerar_codigo() -> str:
+    """Gera um código de acesso aleatório"""
+    import random
+    import string
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 # ==================== INTELIGÊNCIA DO ASSISTENTE ====================
 
 class AssistenteInteligente:
     def __init__(self, user_id):
         self.user_id = user_id
-        self.conn = sqlite3.connect('assistente.db')
+        self.conn = sqlite3.connect(DB_NAME)
         self.c = self.conn.cursor()
     
     def __del__(self):
         self.conn.close()
     
-    def processar(self, texto):
+    def processar(self, texto: str) -> str:
         """Processa o texto e retorna uma resposta"""
         texto_lower = texto.lower()
         
@@ -254,7 +271,7 @@ class AssistenteInteligente:
         # Se não entendeu
         return self.nao_entendi()
     
-    def cumprimentar(self):
+    def cumprimentar(self) -> str:
         hora = datetime.now().hour
         if hora < 12:
             periodo = "Bom dia"
@@ -265,7 +282,7 @@ class AssistenteInteligente:
         
         return f"{periodo}! Como posso ajudar? Posso registrar gastos, ganhos, dívidas, vendas, ou responder perguntas sobre suas finanças."
     
-    def processar_divida(self, texto):
+    def processar_divida(self, texto: str) -> str:
         """Processa tudo relacionado a dívidas"""
         texto_lower = texto.lower()
         pessoa = extrair_pessoa(texto)
@@ -282,7 +299,7 @@ class AssistenteInteligente:
                 self.c.execute('''INSERT INTO dividas_receber 
                                  (user_id, cliente, valor, motivo, data_criacao, status)
                                  VALUES (?, ?, ?, ?, ?, ?)''',
-                              (self.user_id, pessoa, valor, motivo, datetime.now(), 'pendente'))
+                              (self.user_id, pessoa, valor, motivo, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'pendente'))
                 self.conn.commit()
                 
                 return f"✅ Entendi! {pessoa} ficou devendo R$ {valor:.2f} para você. {motivo if motivo else ''}"
@@ -298,7 +315,7 @@ class AssistenteInteligente:
                 self.c.execute('''INSERT INTO dividas_pagar 
                                  (user_id, credor, valor, motivo, data_criacao, status)
                                  VALUES (?, ?, ?, ?, ?, ?)''',
-                              (self.user_id, pessoa, valor, motivo, datetime.now(), 'pendente'))
+                              (self.user_id, pessoa, valor, motivo, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'pendente'))
                 self.conn.commit()
                 
                 return f"✅ Entendi! Você deve R$ {valor:.2f} para {pessoa}. {motivo if motivo else ''}"
@@ -326,20 +343,20 @@ class AssistenteInteligente:
                         if restante >= valor_divida:
                             self.c.execute('''UPDATE dividas_receber SET status = 'pago' WHERE id = ?''', (divida_id,))
                             self.c.execute('''INSERT INTO pagamentos (divida_id, tipo, valor, data)
-                                             VALUES (?, ?, ?, ?)''', (divida_id, 'receber', valor_divida, datetime.now()))
+                                             VALUES (?, ?, ?, ?)''', (divida_id, 'receber', valor_divida, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             restante -= valor_divida
                         else:
                             novo_valor = valor_divida - restante
                             self.c.execute('''UPDATE dividas_receber SET valor = ? WHERE id = ?''', (novo_valor, divida_id))
                             self.c.execute('''INSERT INTO pagamentos (divida_id, tipo, valor, data)
-                                             VALUES (?, ?, ?, ?)''', (divida_id, 'receber', restante, datetime.now()))
+                                             VALUES (?, ?, ?, ?)''', (divida_id, 'receber', restante, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             restante = 0
                     
                     self.conn.commit()
                     
                     # Verificar saldo restante
                     self.c.execute('''SELECT SUM(valor) FROM dividas_receber 
-                                     WHERE user_id = ? AND cliente = ? AND status = 'pendente'''', 
+                                     WHERE user_id = ? AND cliente = ? AND status = 'pendente' ''', 
                                   (self.user_id, pessoa))
                     saldo = self.c.fetchone()[0] or 0
                     
@@ -372,19 +389,19 @@ class AssistenteInteligente:
                         if restante >= valor_divida:
                             self.c.execute('''UPDATE dividas_pagar SET status = 'pago' WHERE id = ?''', (divida_id,))
                             self.c.execute('''INSERT INTO pagamentos (divida_id, tipo, valor, data)
-                                             VALUES (?, ?, ?, ?)''', (divida_id, 'pagar', valor_divida, datetime.now()))
+                                             VALUES (?, ?, ?, ?)''', (divida_id, 'pagar', valor_divida, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             restante -= valor_divida
                         else:
                             novo_valor = valor_divida - restante
                             self.c.execute('''UPDATE dividas_pagar SET valor = ? WHERE id = ?''', (novo_valor, divida_id))
                             self.c.execute('''INSERT INTO pagamentos (divida_id, tipo, valor, data)
-                                             VALUES (?, ?, ?, ?)''', (divida_id, 'pagar', restante, datetime.now()))
+                                             VALUES (?, ?, ?, ?)''', (divida_id, 'pagar', restante, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             restante = 0
                     
                     self.conn.commit()
                     
                     self.c.execute('''SELECT SUM(valor) FROM dividas_pagar 
-                                     WHERE user_id = ? AND credor = ? AND status = 'pendente'''', 
+                                     WHERE user_id = ? AND credor = ? AND status = 'pendente' ''', 
                                   (self.user_id, pessoa))
                     saldo = self.c.fetchone()[0] or 0
                     
@@ -400,13 +417,13 @@ class AssistenteInteligente:
             if pessoa:
                 # Verificar se a pessoa deve para você
                 self.c.execute('''SELECT SUM(valor) FROM dividas_receber 
-                                 WHERE user_id = ? AND cliente = ? AND status = 'pendente'''', 
+                                 WHERE user_id = ? AND cliente = ? AND status = 'pendente' ''', 
                               (self.user_id, pessoa))
                 a_receber = self.c.fetchone()[0] or 0
                 
                 # Verificar se você deve para a pessoa
                 self.c.execute('''SELECT SUM(valor) FROM dividas_pagar 
-                                 WHERE user_id = ? AND credor = ? AND status = 'pendente'''', 
+                                 WHERE user_id = ? AND credor = ? AND status = 'pendente' ''', 
                               (self.user_id, pessoa))
                 a_pagar = self.c.fetchone()[0] or 0
                 
@@ -449,7 +466,7 @@ class AssistenteInteligente:
         
         return None
     
-    def registrar_gasto(self, texto):
+    def registrar_gasto(self, texto: str) -> str:
         """Registra um gasto"""
         valor = extrair_valor(texto)
         if not valor:
@@ -476,12 +493,12 @@ class AssistenteInteligente:
         
         self.c.execute('''INSERT INTO gastos (user_id, descricao, valor, data, categoria)
                          VALUES (?, ?, ?, ?, ?)''',
-                      (self.user_id, descricao.capitalize(), valor, datetime.now(), categoria))
+                      (self.user_id, descricao.capitalize(), valor, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), categoria))
         self.conn.commit()
         
         return f"💰 Gasto registrado: R$ {valor:.2f} em {descricao.capitalize()}"
     
-    def registrar_ganho(self, texto):
+    def registrar_ganho(self, texto: str) -> str:
         """Registra um ganho"""
         valor = extrair_valor(texto)
         if not valor:
@@ -501,7 +518,7 @@ class AssistenteInteligente:
         
         self.c.execute('''INSERT INTO ganhos (user_id, descricao, valor, data, de_quem)
                          VALUES (?, ?, ?, ?, ?)''',
-                      (self.user_id, descricao.capitalize(), valor, datetime.now(), de_quem))
+                      (self.user_id, descricao.capitalize(), valor, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), de_quem))
         self.conn.commit()
         
         if de_quem:
@@ -509,7 +526,7 @@ class AssistenteInteligente:
         else:
             return f"💵 Ganho registrado: R$ {valor:.2f} - {descricao.capitalize()}"
     
-    def registrar_venda(self, texto):
+    def registrar_venda(self, texto: str) -> str:
         """Registra uma venda"""
         valor = extrair_valor(texto)
         cliente = extrair_pessoa(texto)
@@ -540,21 +557,20 @@ class AssistenteInteligente:
             self.c.execute('''INSERT INTO dividas_receber 
                              (user_id, cliente, valor, motivo, data_criacao, status)
                              VALUES (?, ?, ?, ?, ?, ?)''',
-                          (self.user_id, cliente, valor, f"Venda fiado", datetime.now(), 'pendente'))
+                          (self.user_id, cliente, valor, f"Venda fiado", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'pendente'))
             self.conn.commit()
             return f"📝 Venda fiado para {cliente}: R$ {valor:.2f}. Registrei como dívida."
         else:
             self.c.execute('''INSERT INTO vendas (user_id, cliente, produto, valor, data, pago)
                              VALUES (?, ?, ?, ?, ?, ?)''',
                           (self.user_id, cliente, produto_encontrado[0] if produto_encontrado else "produto", 
-                           valor, datetime.now(), 1))
+                           valor, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 1))
             self.conn.commit()
             return f"✅ Venda para {cliente}: R$ {valor:.2f}. Recebido à vista!"
     
-    def responder_pergunta(self, texto):
+    def responder_pergunta(self, texto: str) -> str:
         """Responde perguntas sobre finanças"""
         texto_lower = texto.lower()
-        data_ref = extrair_data(texto)
         
         # ===== SALDO =====
         if 'saldo' in texto_lower:
@@ -571,11 +587,11 @@ class AssistenteInteligente:
             total_vendas = self.c.fetchone()[0] or 0
             
             # Dívidas a receber
-            self.c.execute('''SELECT SUM(valor) FROM dividas_receber WHERE user_id = ? AND status = 'pendente'''', (self.user_id,))
+            self.c.execute('''SELECT SUM(valor) FROM dividas_receber WHERE user_id = ? AND status = 'pendente' ''', (self.user_id,))
             a_receber = self.c.fetchone()[0] or 0
             
             # Dívidas a pagar
-            self.c.execute('''SELECT SUM(valor) FROM dividas_pagar WHERE user_id = ? AND status = 'pendente'''', (self.user_id,))
+            self.c.execute('''SELECT SUM(valor) FROM dividas_pagar WHERE user_id = ? AND status = 'pendente' ''', (self.user_id,))
             a_pagar = self.c.fetchone()[0] or 0
             
             saldo_total = (total_ganhos + total_vendas + a_receber) - (total_gastos + a_pagar)
@@ -637,10 +653,7 @@ class AssistenteInteligente:
         
         # ===== RESUMO =====
         elif 'resumo' in texto_lower or 'extrato' in texto_lower:
-            if 'hoje' in texto_lower:
-                data = datetime.now().strftime("%Y-%m-%d")
-            else:
-                data = extrair_data(texto)
+            data = extrair_data(texto)
             
             # Gastos
             self.c.execute('''SELECT SUM(valor) FROM gastos WHERE user_id = ? AND date(data) = ?''', (self.user_id, data))
@@ -672,7 +685,7 @@ class AssistenteInteligente:
         
         return "Não entendi sua pergunta. Pode reformular?"
     
-    def gerenciar_clientes(self, texto):
+    def gerenciar_clientes(self, texto: str) -> str:
         """Gerencia clientes"""
         texto_lower = texto.lower()
         
@@ -697,7 +710,7 @@ class AssistenteInteligente:
         
         return None
     
-    def lembrar(self, texto):
+    def lembrar(self, texto: str) -> str:
         """Guarda informações para lembrar depois"""
         texto_lower = texto.lower()
         
@@ -709,13 +722,13 @@ class AssistenteInteligente:
                 chave = f"memoria_{datetime.now().timestamp()}"
                 self.c.execute('''INSERT INTO memoria (user_id, chave, valor, data)
                                  VALUES (?, ?, ?, ?)''',
-                              (self.user_id, chave, info, datetime.now()))
+                              (self.user_id, chave, info, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                 self.conn.commit()
                 return f"✅ Ok, vou lembrar: {info}"
         
         return "O que você quer que eu lembre?"
     
-    def nao_entendi(self):
+    def nao_entendi(self) -> str:
         return "Desculpe, não entendi. Você pode falar de outra forma? Por exemplo:\n" \
                "• 'João ficou me devendo 50 reais'\n" \
                "• 'Quanto João me deve?'\n" \
@@ -864,7 +877,7 @@ async def usar_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     codigo = context.args[0].upper()
     user_id = update.effective_user.id
     
-    conn = sqlite3.connect('assistente.db')
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
     c.execute('''SELECT dias, usado FROM codigos WHERE codigo = ?''', (codigo,))
@@ -918,7 +931,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dias = dias_map.get(query.data)
     codigo = gerar_codigo()
     
-    conn = sqlite3.connect('assistente.db')
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''INSERT INTO codigos (codigo, dias) VALUES (?, ?)''', (codigo, dias))
     conn.commit()
