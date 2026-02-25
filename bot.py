@@ -7,16 +7,16 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import re
 import random
 import string
-import io
 import speech_recognition as sr
 from pydub import AudioSegment
 import tempfile
+import threading
+from flask import Flask
 
-# ==================== COLOQUE SEUS DADOS AQUI ====================
-TOKEN = "8778081445:AAF8PEnPHntpnN3wjqNGAfTzWNPhJV_4VxM"  # COLE SEU TOKEN AQUI (do BotFather)
-ADMIN_ID = 5052937721  # COLE SEU ID AQUI (do @userinfobot)
-CONTATO = "@jeffinhooliveira"  # COLE SEU @ DO TELEGRAM PARA CONTATO
-# ================================================================
+# ==================== CONFIGURAÇÕES ====================
+TOKEN = "8778081445:AAF8PEnPHntpnN3wjqNGAfTzWNPhJV_4VxM"  # COLE SEU TOKEN AQUI
+ADMIN_ID = 5052937721  # COLE SEU ID AQUI
+CONTATO = "@jeffinhooliveira"  # SEU CONTATO
 
 # ==================== BANCO DE DADOS ====================
 def init_db():
@@ -50,22 +50,20 @@ def init_db():
                   user_id INTEGER,
                   nome TEXT,
                   preco REAL,
-                  categoria TEXT,
                   ativo INTEGER DEFAULT 1)''')
     
-    # Vendas/Transações
+    # Vendas
     c.execute('''CREATE TABLE IF NOT EXISTS vendas
                  (id INTEGER PRIMARY KEY,
                   user_id INTEGER,
-                  produto_id INTEGER,
                   produto_nome TEXT,
                   cliente_nome TEXT,
                   valor REAL,
                   quantidade INTEGER DEFAULT 1,
                   data TEXT,
-                  observacao TEXT)''')
+                  pago INTEGER DEFAULT 1)''')
     
-    # Transações financeiras (gastos/ganhos)
+    # Transações (gastos/ganhos)
     c.execute('''CREATE TABLE IF NOT EXISTS transacoes
                  (id INTEGER PRIMARY KEY,
                   user_id INTEGER,
@@ -73,7 +71,26 @@ def init_db():
                   descricao TEXT,
                   valor REAL,
                   data TEXT,
-                  categoria TEXT DEFAULT 'geral')''')
+                  pessoa TEXT)''')
+    
+    # DÍVIDAS - NOVA TABELA!
+    c.execute('''CREATE TABLE IF NOT EXISTS dividas
+                 (id INTEGER PRIMARY KEY,
+                  user_id INTEGER,
+                  pessoa TEXT,
+                  valor REAL,
+                  motivo TEXT,
+                  data_criacao TEXT,
+                  data_vencimento TEXT,
+                  status TEXT DEFAULT 'pendente')''')
+    
+    # Pagamentos de dívidas
+    c.execute('''CREATE TABLE IF NOT EXISTS pagamentos_dividas
+                 (id INTEGER PRIMARY KEY,
+                  divida_id INTEGER,
+                  valor REAL,
+                  data TEXT,
+                  observacao TEXT)''')
     
     conn.commit()
     conn.close()
@@ -81,12 +98,10 @@ def init_db():
 # ==================== FUNÇÕES AUXILIARES ====================
 
 def gerar_codigo(tamanho=8):
-    """Gera código único"""
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=tamanho))
 
 def verificar_acesso(user_id):
-    """Verifica se usuário tem acesso"""
-    if user_id == ADMIN_ID:  # Admin tem acesso vitalício
+    if user_id == ADMIN_ID:
         return True
     
     conn = sqlite3.connect('sistema.db')
@@ -96,506 +111,384 @@ def verificar_acesso(user_id):
     conn.close()
     
     if result and result[0] == 1:
-        if result[1]:  # Tem data de expiração
+        if result[1]:
             try:
                 expiracao = datetime.strptime(result[1], "%Y-%m-%d")
                 if expiracao > datetime.now():
                     return True
             except:
-                return True  # Vitalício (sem data)
+                return True
         else:
-            return True  # Vitalício
+            return True
     return False
 
-# ==================== SISTEMA DE CÓDIGOS ====================
+def extrair_valor(texto):
+    """Extrai valor numérico do texto"""
+    valores = re.findall(r'(\d+(?:[.,]\d+)?)', texto)
+    if valores:
+        return float(valores[0].replace(',', '.'))
+    return None
 
-async def codigos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gerar códigos de acesso (só admin)"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Acesso restrito!")
-        return
+def extrair_pessoa(texto):
+    """Extrai nome de pessoa do texto"""
+    # Lista de palavras que podem indicar uma pessoa
+    indicadores = ['para', 'do', 'da', 'de', 'com', 'jefferson', 'paulo', 'joão', 'maria', 'jose', 'ana', 'carlos']
     
-    keyboard = [
-        [InlineKeyboardButton("🎫 Gerar Código 7 dias", callback_data="codigo_7")],
-        [InlineKeyboardButton("🎫 Gerar Código 15 dias", callback_data="codigo_15")],
-        [InlineKeyboardButton("🎫 Gerar Código 30 dias", callback_data="codigo_30")],
-        [InlineKeyboardButton("🎫 Gerar Código Vitalício", callback_data="codigo_vitalicio")],
-        [InlineKeyboardButton("📋 Listar Códigos", callback_data="listar_codigos")],
-    ]
+    palavras = texto.lower().split()
+    for i, palavra in enumerate(palavras):
+        if palavra in indicadores and i + 1 < len(palavras):
+            return palavras[i + 1].capitalize()
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Se encontrar nome próprio (começa com maiúscula no original)
+    for palavra in texto.split():
+        if palavra[0].isupper() and len(palavra) > 2:
+            return palavra
     
-    await update.message.reply_text(
-        "🎫 *GERENCIAR CÓDIGOS*\n\n"
-        "Escolha uma opção:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+    return None
 
-async def processar_codigos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa criação de códigos"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.from_user.id != ADMIN_ID:
-        return
-    
-    dias_map = {
-        'codigo_7': 7,
-        'codigo_15': 15,
-        'codigo_30': 30,
-        'codigo_vitalicio': None  # None = vitalício
-    }
-    
-    if query.data in dias_map:
-        dias = dias_map[query.data]
-        codigo = gerar_codigo()
-        
-        conn = sqlite3.connect('sistema.db')
-        c = conn.cursor()
-        c.execute('''INSERT INTO codigos (codigo, dias, criado_por, data_criacao)
-                     VALUES (?, ?, ?, ?)''',
-                  (codigo, dias, ADMIN_ID, datetime.now()))
-        conn.commit()
-        conn.close()
-        
-        tipo = "VITALÍCIO" if dias is None else f"{dias} DIAS"
-        
-        await query.edit_message_text(
-            f"✅ *Código Gerado com Sucesso!*\n\n"
-            f"📌 *Código:* `{codigo}`\n"
-            f"⏳ *Tipo:* {tipo}\n\n"
-            f"Para usar: /usar {codigo}",
-            parse_mode='Markdown'
-        )
-    
-    elif query.data == "listar_codigos":
-        conn = sqlite3.connect('sistema.db')
-        c = conn.cursor()
-        c.execute('''SELECT codigo, dias, data_criacao, usado_por, ativo 
-                     FROM codigos ORDER BY data_criacao DESC LIMIT 10''')
-        codigos = c.fetchall()
-        conn.close()
-        
-        if not codigos:
-            await query.edit_message_text("📋 Nenhum código encontrado.")
-            return
-        
-        texto = "📋 *ÚLTIMOS CÓDIGOS*\n\n"
-        for cod, dias, criacao, usado, ativo in codigos:
-            status = "✅ Ativo" if ativo else "❌ Usado"
-            tipo = "Vitalício" if dias is None else f"{dias} dias"
-            texto += f"`{cod}` - {tipo}\n"
-            texto += f"📅 {criacao[:10]} - {status}\n"
-            texto += "─" * 20 + "\n"
-        
-        await query.edit_message_text(texto, parse_mode='Markdown')
+# ==================== SISTEMA DE DÍVIDAS ====================
 
-async def usar_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usuário usa código para ativar acesso"""
-    if not context.args:
-        await update.message.reply_text("Use: /usar [CÓDIGO]")
-        return
+async def processar_divida(texto, user_id):
+    """Processa comandos relacionados a dívidas"""
+    texto_lower = texto.lower()
     
-    codigo = context.args[0].upper()
-    user_id = update.effective_user.id
-    
-    conn = sqlite3.connect('sistema.db')
-    c = conn.cursor()
-    
-    # Verifica código
-    c.execute('''SELECT id, dias, ativo FROM codigos WHERE codigo = ?''', (codigo,))
-    result = c.fetchone()
-    
-    if not result:
-        await update.message.reply_text("❌ Código inválido!")
-        conn.close()
-        return
-    
-    codigo_id, dias, ativo = result
-    
-    if not ativo:
-        await update.message.reply_text("❌ Este código já foi usado!")
-        conn.close()
-        return
-    
-    # Calcula expiração
-    if dias:
-        expiracao = (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d")
-    else:
-        expiracao = None  # Vitalício
-    
-    # Registra usuário
-    nome = update.effective_user.first_name or "Cliente"
-    c.execute('''INSERT OR REPLACE INTO usuarios 
-                 (telegram_id, nome, tipo, plano, data_expiracao, ativo)
-                 VALUES (?, ?, ?, ?, ?, 1)''',
-              (user_id, nome, 'cliente', f"{dias or 'Vitalício'} dias", expiracao))
-    
-    # Marca código como usado
-    c.execute('''UPDATE codigos SET usado_por = ?, data_uso = ?, ativo = 0 
-                 WHERE id = ?''', (user_id, datetime.now(), codigo_id))
-    
-    conn.commit()
-    conn.close()
-    
-    await update.message.reply_text(
-        f"🎉 *Acesso Liberado!*\n\n"
-        f"✅ Código válido!\n"
-        f"⏳ Período: {dias or 'Vitalício'} dias\n\n"
-        f"Comece a usar o bot agora mesmo!\n"
-        f"/start para iniciar",
-        parse_mode='Markdown'
-    )
-
-# ==================== SISTEMA DE PRODUTOS ====================
-
-async def produtos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gerenciar produtos"""
-    user_id = update.effective_user.id
-    
-    if not verificar_acesso(user_id):
-        await update.message.reply_text("❌ Acesso negado! Use /usar [CÓDIGO]")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton("➕ Cadastrar Produto", callback_data="add_produto")],
-        [InlineKeyboardButton("📋 Listar Produtos", callback_data="listar_produtos")],
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "📦 *GERENCIAR PRODUTOS*\n\n"
-        "Escolha uma opção:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def processar_produtos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa ações de produtos"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    
-    if not verificar_acesso(user_id):
-        await query.edit_message_text("❌ Acesso negado!")
-        return
-    
-    if query.data == "add_produto":
-        context.user_data['acao'] = 'add_produto'
-        await query.edit_message_text(
-            "📦 *Cadastrar Novo Produto*\n\n"
-            "Envie no formato:\n"
-            "`Nome do Produto - R$ 00,00`\n\n"
-            "Exemplo: Corte de Cabelo - R$ 30,00",
-            parse_mode='Markdown'
-        )
-    
-    elif query.data == "listar_produtos":
-        conn = sqlite3.connect('sistema.db')
-        c = conn.cursor()
-        c.execute('''SELECT id, nome, preco FROM produtos 
-                     WHERE user_id = ? AND ativo = 1''', (user_id,))
-        produtos = c.fetchall()
-        conn.close()
+    # Verificar se é sobre dívida
+    if 'devendo' in texto_lower or 'divida' in texto_lower or 'deve' in texto_lower:
+        pessoa = extrair_pessoa(texto)
+        valor = extrair_valor(texto)
         
-        if not produtos:
-            await query.edit_message_text("📦 Nenhum produto cadastrado.")
-            return
-        
-        texto = "📋 *SEUS PRODUTOS*\n\n"
-        for pid, nome, preco in produtos:
-            texto += f"📌 {nome}\n"
-            texto += f"💰 R$ {preco:.2f}\n"
-            texto += "─" * 20 + "\n"
-        
-        await query.edit_message_text(texto, parse_mode='Markdown')
-
-async def registrar_produto_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Registra produto via texto"""
-    if 'acao' not in context.user_data:
-        return
-    
-    if context.user_data['acao'] == 'add_produto':
-        texto = update.message.text
-        user_id = update.effective_user.id
-        
-        # Tenta extrair nome e preço
-        match = re.search(r'(.+?)[-–—]?\s*R?\$?\s*(\d+(?:[.,]\d+)?)', texto, re.IGNORECASE)
-        
-        if match:
-            nome = match.group(1).strip()
-            preco = float(match.group(2).replace(',', '.'))
+        if pessoa and valor:
+            # Registrar nova dívida
+            motivo = texto
+            for p in ['devendo', 'divida', 'deve', 'ficou', 'me', str(valor).replace('.', ',')]:
+                motivo = motivo.lower().replace(p, '')
+            motivo = motivo.strip()
             
             conn = sqlite3.connect('sistema.db')
             c = conn.cursor()
-            c.execute('''INSERT INTO produtos (user_id, nome, preco)
-                         VALUES (?, ?, ?)''', (user_id, nome, preco))
+            c.execute('''INSERT INTO dividas (user_id, pessoa, valor, motivo, data_criacao, status)
+                         VALUES (?, ?, ?, ?, ?, ?)''',
+                      (user_id, pessoa, valor, motivo, datetime.now(), 'pendente'))
             conn.commit()
             conn.close()
             
-            del context.user_data['acao']
+            return f"✅ *Dívida registrada!*\n\n👤 {pessoa}\n💰 R$ {valor:.2f}\n📝 {motivo}"
+    
+    # Verificar pagamento de dívida
+    elif 'pagou' in texto_lower or 'quitou' in texto_lower or 'recebi' in texto_lower:
+        pessoa = extrair_pessoa(texto)
+        valor = extrair_valor(texto)
+        
+        if pessoa:
+            conn = sqlite3.connect('sistema.db')
+            c = conn.cursor()
             
-            await update.message.reply_text(
-                f"✅ *Produto cadastrado!*\n\n"
-                f"📌 {nome}\n"
-                f"💰 R$ {preco:.2f}",
-                parse_mode='Markdown'
-            )
+            # Buscar dívidas ativas da pessoa
+            c.execute('''SELECT id, valor FROM dividas 
+                         WHERE user_id = ? AND pessoa = ? AND status = 'pendente'
+                         ORDER BY data_criacao''', (user_id, pessoa))
+            dividas = c.fetchall()
+            
+            if not dividas:
+                conn.close()
+                return f"❌ Nenhuma dívida encontrada para {pessoa}"
+            
+            if valor:
+                # Pagamento parcial ou total
+                valor_pago = valor
+                restante = valor_pago
+                
+                for divida_id, valor_divida in dividas:
+                    if restante <= 0:
+                        break
+                    
+                    if restante >= valor_divida:
+                        # Quitar dívida inteira
+                        c.execute('''UPDATE dividas SET status = 'quitada' WHERE id = ?''', (divida_id,))
+                        c.execute('''INSERT INTO pagamentos_dividas (divida_id, valor, data)
+                                     VALUES (?, ?, ?)''', (divida_id, valor_divida, datetime.now()))
+                        restante -= valor_divida
+                    else:
+                        # Pagamento parcial
+                        novo_valor = valor_divida - restante
+                        c.execute('''UPDATE dividas SET valor = ? WHERE id = ?''', (novo_valor, divida_id))
+                        c.execute('''INSERT INTO pagamentos_dividas (divida_id, valor, data)
+                                     VALUES (?, ?, ?)''', (divida_id, restante, datetime.now()))
+                        restante = 0
+                
+                conn.commit()
+                
+                # Verificar se ainda tem dívidas
+                c.execute('''SELECT SUM(valor) FROM dividas 
+                             WHERE user_id = ? AND pessoa = ? AND status = 'pendente'''', (user_id, pessoa))
+                saldo_restante = c.fetchone()[0] or 0
+                
+                conn.close()
+                
+                if saldo_restante == 0:
+                    return f"✅ *Dívida de {pessoa} quitada!* 💰 R$ {valor_pago:.2f} recebidos"
+                else:
+                    return f"✅ *Pagamento registrado!*\n\n👤 {pessoa}\n💰 Pago: R$ {valor_pago:.2f}\n💸 Restante: R$ {saldo_restante:.2f}"
+            else:
+                conn.close()
+                return f"❌ Informe o valor pago. Ex: '{pessoa} pagou 50 reais'"
+    
+    return None
+
+async def consultar_dividas(update, pessoa=None):
+    """Consulta dívidas"""
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect('sistema.db')
+    c = conn.cursor()
+    
+    if pessoa:
+        c.execute('''SELECT pessoa, SUM(valor), COUNT(*) FROM dividas 
+                     WHERE user_id = ? AND pessoa = ? AND status = 'pendente'
+                     GROUP BY pessoa''', (user_id, pessoa))
+    else:
+        c.execute('''SELECT pessoa, SUM(valor), COUNT(*) FROM dividas 
+                     WHERE user_id = ? AND status = 'pendente'
+                     GROUP BY pessoa ORDER BY SUM(valor) DESC''', (user_id,))
+    
+    dividas = c.fetchall()
+    conn.close()
+    
+    if not dividas:
+        if pessoa:
+            return f"✅ {pessoa} não tem dívidas pendentes!"
         else:
-            await update.message.reply_text(
-                "❌ Formato inválido!\n"
-                "Use: Nome do Produto - R$ 30,00"
-            )
+            return "✅ Nenhuma dívida pendente!"
+    
+    if pessoa:
+        total = dividas[0][1]
+        qtd = dividas[0][2]
+        return f"📊 *Dívidas de {pessoa}*\n\n💰 Total: R$ {total:.2f}\n📦 {qtd} dívida(s)"
+    else:
+        texto = "📊 *TODAS AS DÍVIDAS*\n\n"
+        for pes, val, qtd in dividas:
+            texto += f"👤 *{pes}*\n"
+            texto += f"├─ 💰 R$ {val:.2f}\n"
+            texto += f"└─ 📦 {qtd} dívida(s)\n\n"
+        return texto
 
 # ==================== SISTEMA DE VENDAS ====================
 
-async def venda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Registra uma venda"""
-    user_id = update.effective_user.id
-    texto = update.message.text.lower()
-    
-    # Primeiro, verifica se é um produto conhecido
+async def processar_venda(texto, user_id):
+    """Processa venda"""
     conn = sqlite3.connect('sistema.db')
     c = conn.cursor()
-    c.execute('''SELECT id, nome, preco FROM produtos 
-                 WHERE user_id = ? AND ativo = 1''', (user_id,))
+    
+    # Buscar produtos do usuário
+    c.execute('''SELECT nome, preco FROM produtos WHERE user_id = ? AND ativo = 1''', (user_id,))
     produtos = c.fetchall()
     conn.close()
     
-    produto_encontrado = None
-    quantidade = 1
-    cliente = "cliente"
+    texto_lower = texto.lower()
     
-    # Tenta encontrar o produto no texto
-    for pid, pnome, ppreco in produtos:
-        if pnome.lower() in texto:
-            produto_encontrado = (pid, pnome, ppreco)
-            break
+    for prod_nome, prod_preco in produtos:
+        if prod_nome.lower() in texto_lower:
+            # Encontrou produto
+            quantidade = 1
+            qtd_match = re.search(r'(\d+)\s*(?:x|unidades?|un|vezes?)', texto_lower)
+            if qtd_match:
+                quantidade = int(qtd_match.group(1))
+            
+            # Extrair cliente
+            cliente = "cliente"
+            palavras = texto.split()
+            for i, palavra in enumerate(palavras):
+                if palavra.lower() in ['para', 'do', 'da', 'de'] and i + 1 < len(palavras):
+                    cliente = palavras[i + 1]
+                    break
+            
+            valor_total = prod_preco * quantidade
+            
+            # Verificar se é pra pagar depois (dívida)
+            if 'fiado' in texto_lower or 'deve' in texto_lower or 'depois' in texto_lower:
+                # Registrar como dívida
+                conn = sqlite3.connect('sistema.db')
+                c = conn.cursor()
+                c.execute('''INSERT INTO dividas (user_id, pessoa, valor, motivo, data_criacao, status)
+                             VALUES (?, ?, ?, ?, ?, ?)''',
+                          (user_id, cliente, valor_total, f"{quantidade}x {prod_nome}", datetime.now(), 'pendente'))
+                conn.commit()
+                conn.close()
+                
+                return f"📝 *Venda fiado registrada!*\n\n📦 {quantidade}x {prod_nome}\n👤 Cliente: {cliente}\n💰 R$ {valor_total:.2f}\n⏳ *Aguardando pagamento*"
+            else:
+                # Registrar venda normal
+                conn = sqlite3.connect('sistema.db')
+                c = conn.cursor()
+                c.execute('''INSERT INTO vendas (user_id, produto_nome, cliente_nome, valor, quantidade, data, pago)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                          (user_id, prod_nome, cliente, valor_total, quantidade, datetime.now(), 1))
+                conn.commit()
+                conn.close()
+                
+                return f"✅ *VENDA REALIZADA!*\n\n📦 {quantidade}x {prod_nome}\n👤 Cliente: {cliente}\n💰 Total: R$ {valor_total:.2f}"
     
-    if not produto_encontrado:
-        return False  # Não é venda
-    
-    # Tenta extrair quantidade
-    qtd_match = re.search(r'(\d+)\s*(?:x|unidades?|un|vezes?)', texto)
-    if qtd_match:
-        quantidade = int(qtd_match.group(1))
-    
-    # Tenta extrair nome do cliente
-    palavras = texto.split()
-    if 'para' in palavras:
-        idx = palavras.index('para')
-        if idx + 1 < len(palavras):
-            cliente = palavras[idx + 1]
-    elif 'do' in palavras:
-        idx = palavras.index('do')
-        if idx + 1 < len(palavras):
-            cliente = palavras[idx + 1]
-    
-    pid, pnome, ppreco = produto_encontrado
-    valor_total = ppreco * quantidade
-    
-    # Registra venda
-    conn = sqlite3.connect('sistema.db')
-    c = conn.cursor()
-    c.execute('''INSERT INTO vendas 
-                 (user_id, produto_id, produto_nome, cliente_nome, valor, quantidade, data)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
-              (user_id, pid, pnome, cliente, valor_total, quantidade, datetime.now()))
-    conn.commit()
-    conn.close()
-    
-    await update.message.reply_text(
-        f"✅ *VENDA REGISTRADA*\n\n"
-        f"📦 {quantidade}x {pnome}\n"
-        f"👤 Cliente: {cliente}\n"
-        f"💰 Total: R$ {valor_total:.2f}",
-        parse_mode='Markdown'
-    )
-    
-    return True
+    return None
 
-# ==================== RELATÓRIOS ====================
+# ==================== PROCESSAMENTO PRINCIPAL ====================
 
-async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Relatório de vendas"""
+async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processa qualquer mensagem"""
     user_id = update.effective_user.id
     
-    if not verificar_acesso(user_id):
-        await update.message.reply_text("❌ Acesso negado!")
+    if not verificar_acesso(user_id) and user_id != ADMIN_ID:
+        await update.message.reply_text(
+            f"❌ Acesso negado!\n\nContato: {CONTATO}",
+            parse_mode='Markdown'
+        )
         return
     
-    keyboard = [
-        [InlineKeyboardButton("📊 Vendas Hoje", callback_data="rel_hoje")],
-        [InlineKeyboardButton("📊 Vendas Semana", callback_data="rel_semana")],
-        [InlineKeyboardButton("📊 Vendas Mês", callback_data="rel_mes")],
-        [InlineKeyboardButton("💰 Gastos x Ganhos", callback_data="rel_financeiro")],
-    ]
+    texto = update.message.text
+    texto_lower = texto.lower()
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # ===== CONSULTAS =====
+    if any(p in texto_lower for p in ['quanto', 'saldo', 'divida', 'devendo']):
+        # Consultar dívidas específicas
+        if any(p in texto_lower for p in ['jefferson', 'paulo', 'joão', 'maria', 'jose', 'carlos', 'ana']):
+            pessoa = extrair_pessoa(texto)
+            if pessoa:
+                resposta = await consultar_dividas(update, pessoa)
+                await update.message.reply_text(resposta, parse_mode='Markdown')
+                return
+        else:
+            # Todas as dívidas
+            resposta = await consultar_dividas(update)
+            await update.message.reply_text(resposta, parse_mode='Markdown')
+            return
     
+    # ===== DÍVIDAS =====
+    resposta_divida = await processar_divida(texto, user_id)
+    if resposta_divida:
+        await update.message.reply_text(resposta_divida, parse_mode='Markdown')
+        return
+    
+    # ===== VENDAS =====
+    resposta_venda = await processar_venda(texto, user_id)
+    if resposta_venda:
+        await update.message.reply_text(resposta_venda, parse_mode='Markdown')
+        return
+    
+    # ===== GASTOS =====
+    if any(p in texto_lower for p in ['gastei', 'gasto', 'paguei', 'comprei']):
+        valor = extrair_valor(texto)
+        if valor:
+            descricao = texto_lower
+            for p in ['gastei', 'gasto', 'paguei', 'comprei', 'em', str(valor).replace('.', ','), 'r$', 'reais']:
+                descricao = descricao.replace(p, '')
+            descricao = descricao.strip()
+            
+            if not descricao:
+                descricao = 'sem descrição'
+            
+            conn = sqlite3.connect('sistema.db')
+            c = conn.cursor()
+            c.execute('''INSERT INTO transacoes (user_id, tipo, descricao, valor, data)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (user_id, 'gasto', descricao.capitalize(), valor, datetime.now()))
+            conn.commit()
+            conn.close()
+            
+            await update.message.reply_text(
+                f"💰 *Gasto registrado!*\n\nR$ {valor:.2f}\n📝 {descricao.capitalize()}",
+                parse_mode='Markdown'
+            )
+            return
+        else:
+            await update.message.reply_text("❌ Informe o valor! Ex: 'gastei 50 em lanche'")
+            return
+    
+    # ===== GANHOS =====
+    if any(p in texto_lower for p in ['ganhei', 'recebi']):
+        valor = extrair_valor(texto)
+        if valor:
+            descricao = texto_lower
+            for p in ['ganhei', 'recebi', str(valor).replace('.', ','), 'r$', 'reais']:
+                descricao = descricao.replace(p, '')
+            descricao = descricao.strip()
+            
+            if not descricao:
+                descricao = 'sem descrição'
+            
+            conn = sqlite3.connect('sistema.db')
+            c = conn.cursor()
+            c.execute('''INSERT INTO transacoes (user_id, tipo, descricao, valor, data)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (user_id, 'ganho', descricao.capitalize(), valor, datetime.now()))
+            conn.commit()
+            conn.close()
+            
+            await update.message.reply_text(
+                f"💵 *Ganho registrado!*\n\nR$ {valor:.2f}\n📝 {descricao.capitalize()}",
+                parse_mode='Markdown'
+            )
+            return
+        else:
+            await update.message.reply_text("❌ Informe o valor! Ex: 'ganhei 100 do Paulo'")
+            return
+    
+    # Se não entendeu nada
     await update.message.reply_text(
-        "📈 *RELATÓRIOS*\n\n"
-        "Escolha o tipo:",
-        reply_markup=reply_markup,
+        "❓ *Não entendi*\n\n"
+        "Exemplos:\n"
+        "• 'jefferson ficou me devendo 50 reais'\n"
+        "• 'quanto jefferson me deve'\n"
+        "• 'jefferson pagou 30 reais'\n"
+        "• 'corte para joão' (venda)\n"
+        "• 'gastei 50 em lanche'\n"
+        "• 'ganhei 100 do paulo'",
         parse_mode='Markdown'
     )
-
-async def processar_relatorios(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa relatórios"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    hoje = datetime.now()
-    
-    if query.data == "rel_hoje":
-        data_inicio = hoje.strftime("%Y-%m-%d")
-        titulo = "HOJE"
-    elif query.data == "rel_semana":
-        inicio_semana = hoje - timedelta(days=hoje.weekday())
-        data_inicio = inicio_semana.strftime("%Y-%m-%d")
-        titulo = "SEMANA"
-    elif query.data == "rel_mes":
-        data_inicio = hoje.replace(day=1).strftime("%Y-%m-%d")
-        titulo = "MÊS"
-    else:
-        return
-    
-    conn = sqlite3.connect('sistema.db')
-    c = conn.cursor()
-    
-    # Vendas do período
-    c.execute('''SELECT produto_nome, cliente_nome, quantidade, valor, data 
-                 FROM vendas WHERE user_id = ? AND date(data) >= ?
-                 ORDER BY data DESC''', (user_id, data_inicio))
-    vendas = c.fetchall()
-    
-    # Totais
-    c.execute('''SELECT SUM(valor), COUNT(*) FROM vendas 
-                 WHERE user_id = ? AND date(data) >= ?''', (user_id, data_inicio))
-    total_valor, total_vendas = c.fetchone()
-    
-    conn.close()
-    
-    if not vendas:
-        await query.edit_message_text(f"📊 Nenhuma venda em {titulo.lower()}.")
-        return
-    
-    texto = f"📈 *VENDAS {titulo}*\n\n"
-    texto += f"💰 Total: R$ {total_valor:.2f}\n"
-    texto += f"📦 Vendas: {total_vendas}\n\n"
-    texto += "📋 *Detalhado:*\n"
-    
-    for prod, cliente, qtd, valor, data in vendas[:10]:
-        texto += f"🕐 {data[11:16]} - {qtd}x {prod}\n"
-        texto += f"└─ 👤 {cliente} - R$ {valor:.2f}\n\n"
-    
-    await query.edit_message_text(texto, parse_mode='Markdown')
 
 # ==================== ÁUDIO ====================
 
 async def processar_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa áudio e converte para texto"""
-    user_id = update.effective_user.id
-    
-    if not verificar_acesso(user_id):
-        await update.message.reply_text("❌ Acesso negado!")
-        return
-    
-    await update.message.reply_text("🎤 Processando áudio... aguarde...")
-    
-    try:
-        # Baixa o áudio
-        arquivo = await update.message.voice.get_file()
-        
-        # Cria arquivo temporário
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_ogg:
-            await arquivo.download_to_drive(tmp_ogg.name)
-            ogg_path = tmp_ogg.name
-        
-        # Converte para wav
-        wav_path = ogg_path.replace('.ogg', '.wav')
-        audio = AudioSegment.from_ogg(ogg_path)
-        audio.export(wav_path, format="wav")
-        
-        # Reconhece fala
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio_data = recognizer.record(source)
-            texto = recognizer.recognize_google(audio_data, language='pt-BR')
-        
-        # Limpa arquivos temporários
-        os.unlink(ogg_path)
-        os.unlink(wav_path)
-        
-        await update.message.reply_text(f"📝 *Texto reconhecido:*\n{texto}", parse_mode='Markdown')
-        
-        # Processa o texto como se fosse uma mensagem normal
-        update.message.text = texto
-        await registrar_mensagem(update, context)
-        
-    except Exception as e:
-        await update.message.reply_text("❌ Não consegui entender o áudio. Tente falar mais claramente.")
-
-# ==================== REGISTRAR MENSAGEM ====================
-
-async def registrar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Registra qualquer mensagem (gasto, ganho ou venda)"""
+    """Processa áudio"""
     user_id = update.effective_user.id
     
     if not verificar_acesso(user_id) and user_id != ADMIN_ID:
         return
     
-    texto = update.message.text.lower()
+    await update.message.reply_text("🎤 Processando áudio...")
     
-    # Tenta registrar como venda primeiro
-    if await venda(update, context):
-        return
-    
-    # Se não for venda, verifica se é gasto ou ganho
-    if any(p in texto for p in ['gastei', 'gasto', 'paguei', 'comprei']):
-        tipo = 'gasto'
-    elif any(p in texto for p in ['ganhei', 'recebi']):
-        tipo = 'ganho'
-    else:
-        return
-    
-    # Extrai valor
-    valores = re.findall(r'(\d+(?:[.,]\d+)?)', texto)
-    if not valores:
-        await update.message.reply_text("❌ Não consegui identificar o valor!")
-        return
-    
-    valor = float(valores[0].replace(',', '.'))
-    descricao = texto
-    for palavra in ['gastei', 'ganhei', 'recebi', 'paguei', 'comprei', 'em', 'de', 'do', 'da']:
-        descricao = descricao.replace(palavra, '')
-    descricao = descricao.replace(valores[0], '').strip()
-    
-    if not descricao:
-        descricao = 'sem descrição'
-    
-    # Registra
-    conn = sqlite3.connect('sistema.db')
-    c = conn.cursor()
-    c.execute('''INSERT INTO transacoes (user_id, tipo, descricao, valor, data)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (user_id, tipo, descricao, valor, datetime.now()))
-    conn.commit()
-    conn.close()
-    
-    emoji = '💰' if tipo == 'gasto' else '💵'
-    await update.message.reply_text(
-        f"{emoji} *Registrado!*\n\n"
-        f"{'Gasto' if tipo == 'gasto' else 'Ganho'}: R$ {valor:.2f}\n"
-        f"📝 {descricao}",
-        parse_mode='Markdown'
-    )
+    try:
+        # Baixar áudio
+        arquivo = await update.message.voice.get_file()
+        
+        # Salvar temporariamente
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_ogg:
+            await arquivo.download_to_drive(tmp_ogg.name)
+            ogg_path = tmp_ogg.name
+        
+        # Converter para wav
+        wav_path = ogg_path.replace('.ogg', '.wav')
+        audio = AudioSegment.from_ogg(ogg_path)
+        audio.export(wav_path, format="wav")
+        
+        # Reconhecer fala
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+            texto = recognizer.recognize_google(audio_data, language='pt-BR')
+        
+        # Limpar arquivos
+        os.unlink(ogg_path)
+        os.unlink(wav_path)
+        
+        await update.message.reply_text(f"📝 *Você disse:*\n{texto}", parse_mode='Markdown')
+        
+        # Processar o texto
+        update.message.text = texto
+        await processar_mensagem(update, context)
+        
+    except Exception as e:
+        await update.message.reply_text("❌ Não consegui entender. Fale mais claramente ou use texto.")
 
-# ==================== COMANDOS BÁSICOS ====================
+# ==================== COMANDOS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mensagem inicial"""
@@ -604,42 +497,73 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id == ADMIN_ID:
         await update.message.reply_text(
             "👑 *PAINEL ADMIN*\n\n"
-            "Comandos disponíveis:\n"
-            "/codigos - Gerar códigos de acesso\n"
-            "/produtos - Gerenciar produtos\n"
-            "/relatorio - Ver relatórios\n"
-            "/hoje - Resumo de hoje\n\n"
-            "📝 *Exemplos de uso:*\n"
-            "• 'corte para João' (vende produto)\n"
-            "• 'gastei 20 em pizza' (registra gasto)\n"
-            "• 'ganhei 100 do Paulo' (registra ganho)\n"
-            "• Envie ÁUDIO com qualquer comando!",
-            parse_mode='Markdown'
-        )
-    elif verificar_acesso(user_id):
-        await update.message.reply_text(
-            "👋 *Bem-vindo!*\n\n"
-            "📦 *Para vender:* 'corte para João'\n"
-            "💰 *Para gastos:* 'gastei 20 em almoço'\n"
-            "💵 *Para ganhos:* 'ganhei 100 do Paulo'\n"
-            "🎤 *Envie áudios também!*\n\n"
             "Comandos:\n"
+            "/codigos - Gerar códigos\n"
             "/produtos - Cadastrar produtos\n"
-            "/relatorio - Ver vendas\n"
-            "/hoje - Resumo do dia",
+            "/dividas - Ver todas dívidas\n"
+            "/hoje - Resumo do dia\n\n"
+            "💡 *Exemplos:*\n"
+            "• 'joão ficou devendo 50 do lanche'\n"
+            "• 'quanto joão deve'\n"
+            "• 'joão pagou 30'\n"
+            "• 'corte para maria'\n"
+            "• 'gastei 20 em pizza'",
             parse_mode='Markdown'
         )
     else:
         await update.message.reply_text(
-            f"👋 *Assistente Financeiro*\n\n"
-            f"Para usar, você precisa de um código de acesso.\n"
-            f"Use: /usar [CÓDIGO]\n\n"
-            f"💬 Contato: {CONTATO}",
+            "👋 *Olá!*\n\n"
+            "💡 *Exemplos:*\n"
+            "• 'joão ficou devendo 50 reais'\n"
+            "• 'quanto joão me deve'\n"
+            "• 'joão pagou 30 reais'\n"
+            "• 'corte para maria'\n"
+            "• 'gastei 50 em almoço'",
             parse_mode='Markdown'
         )
 
+async def produtos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gerenciar produtos"""
+    user_id = update.effective_user.id
+    
+    if not verificar_acesso(user_id):
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Cadastrar", callback_data="add_produto")],
+        [InlineKeyboardButton("📋 Listar", callback_data="listar_produtos")],
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📦 *GERENCIAR PRODUTOS*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def codigos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gerar códigos (admin)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("🎫 7 dias", callback_data="codigo_7")],
+        [InlineKeyboardButton("🎫 15 dias", callback_data="codigo_15")],
+        [InlineKeyboardButton("🎫 30 dias", callback_data="codigo_30")],
+        [InlineKeyboardButton("🎫 Vitalício", callback_data="codigo_vitalicio")],
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "🎫 *GERAR CÓDIGOS*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
 async def hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resumo de hoje"""
+    """Resumo do dia"""
     user_id = update.effective_user.id
     
     if not verificar_acesso(user_id):
@@ -663,61 +587,222 @@ async def hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Vendas
     c.execute('''SELECT SUM(valor), COUNT(*) FROM vendas 
                  WHERE user_id = ? AND date(data) = ?''', (user_id, hoje))
-    venda_valor, venda_qtd = c.fetchone()
-    venda_valor = venda_valor or 0
-    venda_qtd = venda_qtd or 0
+    venda = c.fetchone()
+    venda_valor = venda[0] or 0
+    venda_qtd = venda[1] or 0
+    
+    # Dívidas recebidas hoje
+    c.execute('''SELECT SUM(valor) FROM pagamentos_dividas WHERE date(data) = ?''', (hoje,))
+    dividas_pagas = c.fetchone()[0] or 0
     
     conn.close()
     
-    saldo = (ganhos + venda_valor) - gastos
+    total_ganhos = ganhos + venda_valor + dividas_pagas
+    saldo = total_ganhos - gastos
     
     await update.message.reply_text(
         f"📊 *RESUMO DE HOJE*\n\n"
         f"💰 Gastos: R$ {gastos:.2f}\n"
         f"💵 Ganhos: R$ {ganhos:.2f}\n"
-        f"🛒 Vendas: R$ {venda_valor:.2f} ({venda_qtd} vendas)\n"
-        f"💸 Saldo: R$ {saldo:.2f}",
+        f"🛒 Vendas: R$ {venda_valor:.2f} ({venda_qtd})\n"
+        f"💳 Dívidas pagas: R$ {dividas_pagas:.2f}\n"
+        f"💸 Saldo do dia: R$ {saldo:.2f}",
         parse_mode='Markdown'
     )
 
-# ==================== MAIN ====================
+async def dividas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ver todas dívidas"""
+    resposta = await consultar_dividas(update)
+    await update.message.reply_text(resposta, parse_mode='Markdown')
 
+async def usar_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usar código de acesso"""
+    if not context.args:
+        await update.message.reply_text("Use: /usar [CÓDIGO]")
+        return
+    
+    codigo = context.args[0].upper()
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect('sistema.db')
+    c = conn.cursor()
+    
+    c.execute('''SELECT id, dias, ativo FROM codigos WHERE codigo = ?''', (codigo,))
+    result = c.fetchone()
+    
+    if not result:
+        await update.message.reply_text("❌ Código inválido!")
+        conn.close()
+        return
+    
+    codigo_id, dias, ativo = result
+    
+    if not ativo:
+        await update.message.reply_text("❌ Código já usado!")
+        conn.close()
+        return
+    
+    expiracao = (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d") if dias else None
+    nome = update.effective_user.first_name or "Cliente"
+    
+    c.execute('''INSERT OR REPLACE INTO usuarios 
+                 (telegram_id, nome, tipo, plano, data_expiracao, ativo)
+                 VALUES (?, ?, ?, ?, ?, 1)''',
+              (user_id, nome, 'cliente', f"{dias or 'Vitalício'} dias", expiracao))
+    
+    c.execute('''UPDATE codigos SET usado_por = ?, data_uso = ?, ativo = 0 
+                 WHERE id = ?''', (user_id, datetime.now(), codigo_id))
+    
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"🎉 *Acesso Liberado!*\n\n"
+        f"⏳ {dias or 'Vitalício'} dias\n"
+        f"✅ Comece a usar!",
+        parse_mode='Markdown'
+    )
+
+# ==================== CALLBACKS ====================
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processa callbacks dos botões"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if query.data.startswith('codigo_'):
+        if user_id != ADMIN_ID:
+            return
+        
+        dias_map = {
+            'codigo_7': 7,
+            'codigo_15': 15,
+            'codigo_30': 30,
+            'codigo_vitalicio': None
+        }
+        
+        dias = dias_map.get(query.data)
+        codigo = gerar_codigo()
+        
+        conn = sqlite3.connect('sistema.db')
+        c = conn.cursor()
+        c.execute('''INSERT INTO codigos (codigo, dias, criado_por, data_criacao)
+                     VALUES (?, ?, ?, ?)''',
+                  (codigo, dias, ADMIN_ID, datetime.now()))
+        conn.commit()
+        conn.close()
+        
+        tipo = "VITALÍCIO" if dias is None else f"{dias} DIAS"
+        
+        await query.edit_message_text(
+            f"✅ *Código gerado!*\n\n"
+            f"`{codigo}`\n"
+            f"⏳ {tipo}",
+            parse_mode='Markdown'
+        )
+    
+    elif query.data == "add_produto":
+        context.user_data['acao'] = 'add_produto'
+        await query.edit_message_text(
+            "📦 *Envie o produto:*\n"
+            "`Nome - Preço`\n"
+            "Ex: Corte de Cabelo - 30",
+            parse_mode='Markdown'
+        )
+    
+    elif query.data == "listar_produtos":
+        conn = sqlite3.connect('sistema.db')
+        c = conn.cursor()
+        c.execute('''SELECT nome, preco FROM produtos 
+                     WHERE user_id = ? AND ativo = 1''', (user_id,))
+        produtos = c.fetchall()
+        conn.close()
+        
+        if not produtos:
+            await query.edit_message_text("📦 Nenhum produto cadastrado.")
+            return
+        
+        texto = "📋 *PRODUTOS*\n\n"
+        for nome, preco in produtos:
+            texto += f"📌 {nome}: R$ {preco:.2f}\n"
+        
+        await query.edit_message_text(texto, parse_mode='Markdown')
+
+async def registrar_produto_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registra produto via texto"""
+    if 'acao' not in context.user_data or context.user_data['acao'] != 'add_produto':
+        return
+    
+    texto = update.message.text
+    match = re.search(r'(.+?)[-–—]?\s*R?\$?\s*(\d+(?:[.,]\d+)?)', texto, re.IGNORECASE)
+    
+    if match:
+        nome = match.group(1).strip()
+        preco = float(match.group(2).replace(',', '.'))
+        
+        conn = sqlite3.connect('sistema.db')
+        c = conn.cursor()
+        c.execute('''INSERT INTO produtos (user_id, nome, preco)
+                     VALUES (?, ?, ?)''', (update.effective_user.id, nome, preco))
+        conn.commit()
+        conn.close()
+        
+        del context.user_data['acao']
+        
+        await update.message.reply_text(
+            f"✅ *Produto cadastrado!*\n\n"
+            f"📌 {nome}\n"
+            f"💰 R$ {preco:.2f}",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("❌ Formato inválido! Use: Nome - 30")
+
+# ==================== SERVIDOR WEB ====================
+app_web = Flask(__name__)
+
+@app_web.route('/')
+def home():
+    return "🤖 Bot Financeiro Rodando 24/7!"
+
+def run_web():
+    app_web.run(host='0.0.0.0', port=8080)
+
+# ==================== MAIN ====================
 def main():
-    # Inicia banco
+    # Iniciar banco
     init_db()
     
-    # Cria aplicação
+    # Iniciar servidor web em background
+    threading.Thread(target=run_web, daemon=True).start()
+    
+    # Criar bot
     app = Application.builder().token(TOKEN).build()
     
-    # Comandos públicos
+    # Comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("usar", usar_codigo))
+    app.add_handler(CommandHandler("codigos", codigos))
+    app.add_handler(CommandHandler("produtos", produtos))
+    app.add_handler(CommandHandler("dividas", dividas))
     app.add_handler(CommandHandler("hoje", hoje))
     app.add_handler(CommandHandler("semana", hoje))
     app.add_handler(CommandHandler("mes", hoje))
-    app.add_handler(CommandHandler("produtos", produtos))
-    app.add_handler(CommandHandler("relatorio", relatorio))
-    
-    # Comandos admin
-    app.add_handler(CommandHandler("codigos", codigos))
     
     # Callbacks
-    app.add_handler(CallbackQueryHandler(processar_codigos, pattern="^codigo_|^listar_codigos"))
-    app.add_handler(CallbackQueryHandler(processar_produtos, pattern="^add_produto|^listar_produtos"))
-    app.add_handler(CallbackQueryHandler(processar_relatorios, pattern="^rel_"))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     
-    # Mensagens de texto
+    # Mensagens
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registrar_produto_texto), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registrar_mensagem), group=2)
-    
-    # Áudio
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_mensagem), group=2)
     app.add_handler(MessageHandler(filters.VOICE, processar_audio))
     
-    print("=" * 50)
+    print("="*50)
     print("🤖 BOT INICIADO COM SUCESSO!")
-    print(f"👑 Admin ID: {ADMIN_ID}")
-    print(f"📞 Contato: {CONTATO}")
-    print("=" * 50)
+    print(f"👑 Admin: {ADMIN_ID}")
+    print("="*50)
     
     app.run_polling()
 
