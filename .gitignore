@@ -1,0 +1,17 @@
+# Ignorar variáveis de ambiente
+.env
+
+# Ignorar arquivos de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+*.log
+
+# Ignorar arquivos temporários
+*.tmp
+*.wav
+*.ogg
