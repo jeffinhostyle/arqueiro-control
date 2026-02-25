@@ -1,15 +1,4 @@
-FROM python:3.11-slim
-
-WORKDIR /app
-
-# Instalar FFmpeg para áudio
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY bot.py .
-
-CMD ["python", "bot.py"]
+python-telegram-bot==20.7
+SpeechRecognition==3.10.0
+pydub==0.25.1
+flask==2.3.3
